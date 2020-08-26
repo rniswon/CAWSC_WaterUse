@@ -1,4 +1,3 @@
-import sys
 import os
 import numpy as np
 import xarray as xr
@@ -12,6 +11,7 @@ import multiprocessing as mp
 from functools import reduce
 import logging
 import platform
+import pickle
 
 if platform.system().lower() != "windows":
     import ray
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s:%(levelname)s:%(message)s')
 # file_handler = logging.FileHandler('GridMETDataCollector.log', mode='w')
-file_handler = logging.FileHandler('GridMETDataCollector.log')
+file_handler = logging.FileHandler('GridMETDataCollectorNew.log')
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
@@ -44,14 +44,12 @@ class _DataDict(dict):
 
 class DataCollector(object):
 
-    def __init__(self, folder=None, verbose=True):
+    def __init__(self, verbose=True):
 
         # build gridMET grid
         self._met_grid = _Grid(verbose=verbose)
         # dictionary to store met data
         self._met_dict = {}
-        # folder of gridMET nc files
-        self.out_folder = folder
         self._verbose = verbose
 
         self._params = {
@@ -111,9 +109,12 @@ class DataCollector(object):
 
     def get_data(self, shp, zone_field, year_filter=None, climate_filter=None,
              multiprocessing=False, chunksize=None, save_to_csv=False, cpu_count=None,
-                 filter_field=None):
+                 filter_field=None, out_folder=None, loadpickle=False):
+
+        logger.info('Starting processing climate data...')
 
         # get shapefile projection epsg code
+        master_climate_dict = {}
         shp_epsg = _get_spatial_ref(shp)
         if shp_epsg != 4326:  # WGS84 GridMET prj
             logger.error('PROJECTION ERROR: The shapefile projection must be WGS84')
@@ -122,36 +123,107 @@ class DataCollector(object):
 
         # download grid met data
         self._downloader(climate_filter=climate_filter)
-        if chunksize is not None:
-            save_to_csv = True
+        # if chunksize is not None:
+        #     save_to_csv = True
 
         shp_geo_list, shp_attr_list = _read_shapefile(shp, zone_field, filter_field=filter_field)
+        total_polygons = len(shp_attr_list)
+        logger.info('Total Polygons = {}'.format(total_polygons))
+        logger.info('Chunk size = {}'.format(chunksize))
+        if loadpickle:
+            logger.warning('RESTART: Loaded from pickle')
+            left_off = load_pickle()[0]
+            # print('loaded pickle left off @ {}', left_off)
+            logger.info('Finding restart point....')
+            index = shp_attr_list.index(left_off)
+            npolys = len(shp_attr_list[:index])
+            shp_attr_list = shp_attr_list[index:]
+            # print(shp_attr_list)
+            shp_geo_list = shp_geo_list[index:]
+
+        else:
+            npolys = 0
+
+
         # shp_geo, shp_attr = _read_shapefile(shp, zone_field)
         # print('shape attr list', shp_attr_list)
         if self._verbose:
             print('Processing climate data')
         # logger.info('Processing climate data')
-        if chunksize is not None:
-            # logger.info('Dividing Chunks')
-            shp_geo_list = list(self.divide_chunks(shp_geo_list, chunksize ))
-            shp_attr_list = list(self.divide_chunks(shp_attr_list, chunksize))
 
+        if chunksize is not None:
+            logger.info('Dividing Chunks.....')
+            shp_geo_list = list(self.divide_chunks(shp_geo_list, chunksize))
+            shp_attr_list = list(self.divide_chunks(shp_attr_list, chunksize))
+            # number of chunks
+            nchunks = len(shp_geo_list)
+
+            total_chunk_time = 0.0
+            chunk_count = 1
             for ichunk in range(len(shp_geo_list)):
+
+
+                chunk_time = time.time()
 
                 shp_geo = shp_geo_list[ichunk]
                 shp_attr = shp_attr_list[ichunk]
 
+                logging.info('Writing pickle...')
+                write_pickle(shp_attr)
+
+                logger.info('Chunk IDS {}'.format(','.join(shp_attr)))
+
+
                 # intersect the shp with the met grid
                 # returns a weights dictionary
+                logger.info('Intersecting polygons with GridMET....')
+                intersect_time = time.time()
                 weights = self._met_grid.intersect(shp_geo, zones=shp_attr)
+                intersect_time = time.time() - intersect_time
+                logger.info('Intersect time = {}'.format(intersect_time))
 
                 # process the downloaded data
+                climate_dict_time = time.time()
                 climate_dict = self._process(weights, year_filter=year_filter,
                                  multiprocessing=multiprocessing, cpu_count=cpu_count)
+                climate_dict_time = time.time() - climate_dict_time
+                logger.info('Time to build climate dict for chunk = {}'.format(climate_dict_time))
+
                 if save_to_csv:
-                    self.clim_to_csv(climate_dict)
-                # else:
-                #     return climate_dict # doesn't work
+                    savetocsv_time = time.time()
+                    self.clim_to_csv(climate_dict, out_folder)
+                    savetocsv_time = time.time() - savetocsv_time
+                    logger.info('Save to CSV time = {}'.format(savetocsv_time))
+                    npolys += chunksize
+                    precent_polys = (npolys/float(total_polygons)) * 100
+                    logger.info('PROCESSED {}/{} POLYGONS {}%'.format(npolys,
+                                    total_polygons, precent_polys))
+                    chunk_time = time.time() - chunk_time
+                    logger.info('Chunk Process Time = {}'.format(chunk_time))
+                    total_chunk_time += chunk_time
+                    avg_chunk_time = total_chunk_time/float(chunk_count)
+                    logger.info('Average Chunk Process Time = {}'.format(avg_chunk_time))
+                    remaining_chunks = nchunks - chunk_count
+                    logger.info('Number of Remaining Chunks = {}'.format(remaining_chunks))
+                    est_remaining_time = avg_chunk_time * remaining_chunks
+                    logger.info('Estimated Remaining Time = {}'.format(est_remaining_time))
+
+                    chunk_count += 1
+
+
+
+                else:
+                    # returning climate dict
+                    # update the master_climate_dict with climate dict
+                    if len(master_climate_dict) == 0:
+                        master_climate_dict = climate_dict
+                    else:
+                        for climate_var, climate_df in climate_dict.items():
+                            if climate_var in master_climate_dict:
+                                # data frame area colums
+                                master_climate_dict[climate_var] = \
+                                    pd.concat([master_climate_dict[climate_var],
+                                              climate_df], axis=1)
 
         else:
 
@@ -165,20 +237,31 @@ class DataCollector(object):
                                          cpu_count=cpu_count)
 
             if save_to_csv:
-                self.clim_to_csv(climate_dict)
-            else:
-                return climate_dict
+                if out_folder == None:
+                    raise Exception('Error: Need to set path to output folder with output_folder keyword')
+                self.clim_to_csv(climate_dict, out_folder)
 
-    def clim_to_csv(self, climate_dict):
+            else:
+                master_climate_dict = climate_dict
+
+        if not save_to_csv:
+            return master_climate_dict
+
+    def clim_to_csv(self, climate_dict, out_folder):
+        logger.info('Saving to CSV')
+        if not os.path.exists(out_folder):
+            os.mkdir(out_folder)
 
         for item in climate_dict.items():
             df = climate_dict[item[0]]
             for col in df.columns:
-                ws = self.out_folder
+                ws = out_folder
                 fn = '{}_{}.csv'.format(item[0], col)
                 fn = os.path.join(ws, fn)
                 df_ = pd.DataFrame(climate_dict[item[0]][col])
                 df_.to_csv(fn)
+        # raise Exception("TESTING CRASH")
+
 
     def _downloader(self, climate_filter=None):
 
@@ -216,18 +299,14 @@ class DataCollector(object):
                 print('downloading data for ', met_name)
             # Pulling the full time series then filtering later seems faster than selecting here
             met_nc = '{}/{}.nc#fillmismatch'.format(opendap_url, self._params[met_name]['nc'])
+            print('MET NC')
+            print(met_nc)
+            exit()
             # fname = '{}.nc'.format(met_name)
             ds = xr.open_dataset(met_nc)
-            # print(ds)
-            # print('saving to netcdf')
-            #     mode = 'w'
-            #     if os.path.exists(fname):
-            #         mode = 'a'
-            #     ds.to_netcdf('{}.nc'.format(met_name), mode=mode)
-            # print('1 year download time', time.time() - t1)
+
             self._met_dict[met_name] = ds
 
-    #
     def _process(self, weights, year_filter=None, multiprocessing=False, cpu_count=None):
         # logger.info('Processing climate data')
         # if self._verbose:
@@ -237,8 +316,9 @@ class DataCollector(object):
         # convert weight dict to df
         weight_df = pd.DataFrame(weights)
 
+
         # get the gridmet cells that have been intersected
-        # fid_time = time.time()
+        fid_time = time.time()
         fids = list(weight_df.index.values)
         # rows = []
         # cols = []
@@ -248,20 +328,27 @@ class DataCollector(object):
             # fid_dict[(row, col)] = fid
             fid_dict[fid] = row, col
             # rows.append(row)
-            # cols.append(col)
-        # print(fid_dict)
-        # print('fid time', time.time() - fid_time)
+        fid_time = time.time() - fid_time
+        logger.info('FID TIME = {}'.format(fid_time))
         climate_dict = {}
         for met_name in self._met_dict:
 
             # if self._verbose:
             #     print('Processing ', met_name)
-            # logger.info('Processing {}'.format(met_name))
+            logger.info('Processing {}'.format(met_name))
 
+            process_time = time.time()
+            logger.info('Processing cells...')
             data = self._process_cells(met_name, fid_dict, start_date, end_date,
                                      multiprocessing, cpu_count)
+            process_time = time.time() - process_time
+            logger.info('Process time for all met cells = {}'.format(process_time))
 
+            postprocess_time = time.time()
+            logger.info('Post Processing....')
             climate_df = self._post_proc(data, weight_df)
+            postprocess_time = time.time() - postprocess_time
+            logger.info('Post Process totalt time = {}'.format(postprocess_time))
             climate_dict[met_name] = climate_df
 
         return climate_dict
@@ -304,43 +391,80 @@ class DataCollector(object):
         return data
 
     def _post_proc(self, data, weight_df):
-        # post_start = time.time()
-        if self._verbose:
-            print('post processing...')
+        post_start = time.time()
+        # if self._verbose:
+        #     print('post processing...')
         # get the area names
+        weight_df.fillna(0, inplace=True) #  MOVE THIS
         area_keys = list(weight_df.columns.values)
-        # c1 = time.time()
+
+        # build a list for data frames
         dfs = []
+        # loop through the grid met cells
+        # fid, and corresponding dataframe
+        store = True  #  update logic
+        store_df = None
+        pp1 = time.time()
         for fid, df in data:
             # loop through the areas
+            df.fillna(0, inplace=True)
             for area in area_keys:
                 # creating new area field climate val * frac area for fid and area
                 weight = weight_df.loc[fid, area]
-                df['{}_val'.format(area)] = df['VAL'] * weight_df.loc[
-                    fid, area]
-                df['{}_weight'.format(area)] = np.where(df.VAL.isnull(),
-                                                        np.nan,
-                                                        weight)
-            df.drop('VAL', axis=1, inplace=True)
-            dfs.append(df)
+                if store:
+                    # calculate the weighted area
+                    df['{}_val'.format(area)] = df['VAL'] * weight
+                    # assign the weights to weight field
+                    df['{}_weight'.format(area)] = weight
+
+                    # print('check store')
+                    # df.to_csv('df_pre_store.csv')
+                else:
+
+                    # calculate the weighted area
+                    store_df['{}_val'.format(area)] += df['VAL'] * weight
+                    # assign the weights to weight field
+                    store_df['{}_weight'.format(area)] += weight
+                    # print('store_df')
+                    # store_df.to_csv('store_df_{}_{}.csv'.format(fid, area))
+                    # exit()
+            if store:
+                store_df = df
+                store_df.drop('VAL', axis=1, inplace=True)
+                # store_df.to_csv('intial_store.csv')
+            store = False
+        # store_df.to_csv('store_df.csv')
+        # exit()
+
+                # print('second test', time.time() - test2)
+            # get rid of the VAL column
+            # df.drop('VAL', axis=1, inplace=True)
+            # append data frame to dfs (data frame list)
+            # dfs.append(df)
+        pp1 = time.time() - pp1
+        logger.info('PP1 time = {}'.format(pp1))
         # print('inner loop post proc time', time.time() - c1)
         # dfs = data.keys
-        d = reduce(lambda x, y: x.add(y, fill_value=0), dfs)
+        # pp2 = time.time()
+        # # add teh data frames together
+        # d = reduce(lambda x, y: x.add(y, fill_value=0), dfs)
+        # pp2 = time.time() - pp2
+        # logger.info('PP2 time = {}'.format(pp2))
+        pp3 = time.time()
+        # calculate the weighted average
+        d = store_df
+        d.to_csv('d_test.csv')
         for area in area_keys:
             val_col = '{}_val'.format(area)
             weight_col = '{}_weight'.format(area)
             d[area] = d[val_col] / d[weight_col]
             d.drop([val_col, weight_col], axis=1, inplace=True)
-
+        pp3 = time.time() - pp3
+        logger.info('PP2 time = {}'.format(pp3))
+        # exit()
         # print(d)
         # print('post proc time ', time.time() - post_start)
         return d
-
-    # @staticmethod
-    # def _check_retry(data):
-    #     retry_fids = [item[0] for item in data if item[1] is None]
-    #     # if there are failed cells redownload climate and retry
-    #     return retry_fids
 
     @staticmethod
     def _build_dates(year_filter):
@@ -414,12 +538,12 @@ class DataCollector(object):
                     row, 'lon': col}).drop(['crs', 'lat', 'lon']).rename({met_name:'VAL'})
                 out_df = selection.to_dataframe()
             except Exception as e:
-                print(e)
+                # print(e)
                 out_df = None
                 logger.error('To DataFrame Export Error: '
                              '{}, FID:{}, ROW:{}, COL:{}, StartDate:{}, EndDate:'
                              '{}\n'.format(met_name, fid, row,
-                            col, start_date, end_date), exc_info=True)
+                            col, start_date, end_date), exc_info=False)
                 print('RETRYING {}'.format(try_num))
                 logger.info('Retrying export to df FID {}...Retry #{}'.format(fid, try_num))
             try_num += 1
@@ -490,8 +614,9 @@ class _Grid(object):
                 continue
             if self._spatial_index is not None:
                 xmin, xmax, ymin, ymax = geo2.GetEnvelope()
-                for fid1 in list(self._spatial_index.intersection((xmin, xmax, ymin,
-                                                      ymax))):
+                for fid1 in list(
+                        self._spatial_index.intersection((xmin, xmax, ymin,
+                                                          ymax))):
 
                     geo1 = self.grid_polys[fid1]
 
@@ -597,9 +722,17 @@ def _to_df_ray(in_data):
     return fid, out_df
 
 
-def _read_shapefile(in_shp, zone_field=None, filter_field=None):
+def write_pickle(val):
+    with open('cdc_pickle_file', 'wb') as f:
+        pickle.dump(val, f)
 
-    print('my zone field is', zone_field)
+
+def load_pickle():
+    with open('cdc_pickle_file', 'rb') as f:
+        data = pickle.load(f)
+    return data
+
+def _read_shapefile(in_shp, zone_field=None, filter_field=None):
 
     # start_time = time.time()
     """
@@ -609,7 +742,7 @@ def _read_shapefile(in_shp, zone_field=None, filter_field=None):
     """
     driver = ogr.GetDriverByName('ESRI Shapefile')
     data_source = driver.Open(in_shp, 0)
-    layer = data_source.GetLayer()
+    layer = data_source.GetLayer()  # hardcoded for test
     geo_list = []
     attr_list = []
 
@@ -635,7 +768,9 @@ def _read_shapefile(in_shp, zone_field=None, filter_field=None):
                 process = False
         else:
             process = True
+        # print(process)
         if process:
+            # print('1 zone field', zone_field)
             if zone_field is not None:
                 zone = feature.GetField(zone_field)
                 attr_list.append(zone)
@@ -658,6 +793,18 @@ def _get_spatial_ref(in_shp):
     epsg = int(spatial_ref.GetAttrValue('AUTHORITY', 1))
 
     return epsg
+
+
+# def _python_mp(function, function_inputs, cpu_count):
+#     if cpu_count is None:
+#         cpu_count = mp.cpu_count()
+#     print(function, function_inputs)
+#     pool = mp.Pool(processes=cpu_count)
+#     data = pool.map(function, function_inputs)
+#     pool.close()
+#     pool.join()
+#
+#     return data
 
 
 if __name__ == '__main__':
