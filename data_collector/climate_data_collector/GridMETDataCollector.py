@@ -8,7 +8,6 @@ import rtree
 import datetime as dt
 import math
 import multiprocessing as mp
-from functools import reduce
 import logging
 import platform
 import pickle
@@ -22,10 +21,13 @@ else:
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s:%(levelname)s:%(message)s')
-# file_handler = logging.FileHandler('GridMETDataCollector.log', mode='w')
-file_handler = logging.FileHandler('GridMETDataCollectorNew.log')
+file_handler = logging.FileHandler('GridMETDataCollector.log')
 file_handler.setFormatter(formatter)
+# file_handler.setLevel(logging.INFO)
 logger.addHandler(file_handler)
+logger.propagate = False
+# logging.getLogger().setLevel((logging.WARNING))
+# logging.StreamHandler(stream=None)
 
 
 class _DataDict(dict):
@@ -89,7 +91,7 @@ class DataCollector(object):
         self._ray = False
         if platform.system().lower() != "windows":
             self._ray = True
-
+            ray.init(address="auto")
 
     @property
     def met_dict(self):
@@ -102,7 +104,8 @@ class DataCollector(object):
            """
         return self._met_dict
 
-    def divide_chunks(self, l, n):
+    @staticmethod
+    def divide_chunks(l, n):
         # looping till length l
         for i in range(0, len(l), n):
             yield l[i:i + n]
@@ -120,11 +123,6 @@ class DataCollector(object):
             logger.error('PROJECTION ERROR: The shapefile projection must be WGS84')
             raise Exception('PROJECTION ERROR: The shapefile '
                             'projection must be WGS84')
-
-        # download grid met data
-        self._downloader(climate_filter=climate_filter)
-        # if chunksize is not None:
-        #     save_to_csv = True
 
         shp_geo_list, shp_attr_list = _read_shapefile(shp, zone_field, filter_field=filter_field)
         total_polygons = len(shp_attr_list)
@@ -144,7 +142,6 @@ class DataCollector(object):
         else:
             npolys = 0
 
-
         # shp_geo, shp_attr = _read_shapefile(shp, zone_field)
         # print('shape attr list', shp_attr_list)
         if self._verbose:
@@ -162,7 +159,6 @@ class DataCollector(object):
             chunk_count = 1
             for ichunk in range(len(shp_geo_list)):
 
-
                 chunk_time = time.time()
 
                 shp_geo = shp_geo_list[ichunk]
@@ -172,7 +168,7 @@ class DataCollector(object):
                 write_pickle(shp_attr)
 
                 logger.info('Chunk IDS {}'.format(','.join(shp_attr)))
-
+                logger.info('Chunk IDS {}'.format(','.join(shp_attr)))
 
                 # intersect the shp with the met grid
                 # returns a weights dictionary
@@ -194,7 +190,7 @@ class DataCollector(object):
                     self.clim_to_csv(climate_dict, out_folder)
                     savetocsv_time = time.time() - savetocsv_time
                     logger.info('Save to CSV time = {}'.format(savetocsv_time))
-                    npolys += chunksize
+                    npolys += len(shp_geo)
                     precent_polys = (npolys/float(total_polygons)) * 100
                     logger.info('PROCESSED {}/{} POLYGONS {}%'.format(npolys,
                                     total_polygons, precent_polys))
@@ -209,7 +205,6 @@ class DataCollector(object):
                     logger.info('Estimated Remaining Time = {}'.format(est_remaining_time))
 
                     chunk_count += 1
-
 
 
                 else:
@@ -247,7 +242,8 @@ class DataCollector(object):
         if not save_to_csv:
             return master_climate_dict
 
-    def clim_to_csv(self, climate_dict, out_folder):
+    @staticmethod
+    def clim_to_csv(climate_dict, out_folder):
         logger.info('Saving to CSV')
         if not os.path.exists(out_folder):
             os.mkdir(out_folder)
@@ -260,52 +256,16 @@ class DataCollector(object):
                 fn = os.path.join(ws, fn)
                 df_ = pd.DataFrame(climate_dict[item[0]][col])
                 df_.to_csv(fn)
-        # raise Exception("TESTING CRASH")
 
-
-    def _downloader(self, climate_filter=None):
+    def _set_up_opendap(self, met_name):
 
         pd.options.display.float_format = '{:,.10f}'.format
-        # set up url and paramters
         opendap_url = 'http://thredds.northwestknowledge.net:8080/thredds/dodsC'
-        # elev_nc = '{}/{}'.format(
-        #     opendap_url, '/MET/elev/metdata_elevationdata.nc#fillmismatch')
+        met_nc = '{}/{}.nc#fillmismatch'.format(opendap_url,
+                                                self._params[met_name][
+                                                    'nc'])
 
-        # configure climate filter
-        if climate_filter is not None:
-            if isinstance(climate_filter, str):
-                climate_filter = [climate_filter]
-            elif isinstance(climate_filter, list):
-                pass
-            else:
-                raise Exception('climate_filter is not str or list of str')
-
-            for name in climate_filter:
-                if name not in self._params:
-                    name = name.lower()
-                    raise Exception('Name {} is a valid GridMET climate '
-                                    'variable'.format(name))
-        else:
-            climate_filter = self._params.keys()
-
-        # check whats in the climate dictionary
-        # add whats needed
-        missing_met = [met for met in climate_filter if met not in
-                         self._met_dict]
-
-        for met_name in missing_met:
-            logger.info('downloading data for {}'.format(met_name))
-            if self._verbose:
-                print('downloading data for ', met_name)
-            # Pulling the full time series then filtering later seems faster than selecting here
-            met_nc = '{}/{}.nc#fillmismatch'.format(opendap_url, self._params[met_name]['nc'])
-            print('MET NC')
-            print(met_nc)
-            exit()
-            # fname = '{}.nc'.format(met_name)
-            ds = xr.open_dataset(met_nc)
-
-            self._met_dict[met_name] = ds
+        return met_nc
 
     def _process(self, weights, year_filter=None, multiprocessing=False, cpu_count=None):
         # logger.info('Processing climate data')
@@ -357,16 +317,16 @@ class DataCollector(object):
                      multiprocessing, cpu_count):
         data_input = [
             [self._params[met_name]['var'], fid,
-             self._met_dict[
-                 met_name], fid_dict[fid][0], fid_dict[fid][1], start_date, end_date] for fid in fid_dict]
+             self._set_up_opendap(met_name), fid_dict[fid][0], fid_dict[fid][1], start_date, end_date] for fid in fid_dict]
 
         if multiprocessing:
             # logger.info('Multiprocessing')
             # mp_proc_time = time.time()
             if self._ray:
+                # logger.info('RAY MP....')
                 actors = []
                 for item in data_input:
-                    actor = _to_df_ray.remote(item)
+                    actor = to_df_ray.remote(item)
                     actors.append(actor)
                 data = ray.get(actors)
 
@@ -524,7 +484,8 @@ class DataCollector(object):
     @staticmethod
     def _to_df(in_data):
 
-        met_name, fid, ds, row, col, start_date, end_date = in_data
+        met_name, fid, met_nc, row, col, start_date, end_date = in_data
+        ds = xr.open_dataset(met_nc)
         out_df = None
         try_num = 1
         while out_df is None:
@@ -611,7 +572,9 @@ class _Grid(object):
             geo2 = in_geo[fid2]
             if not geo2.IsValid():
                 logger.warning("Geo FID: {} not valid".format(fid2))
-                continue
+                logger.info("Trying geometry extent")
+                geo_valid = False
+                geo2 = get_envelope(geo2)
             if self._spatial_index is not None:
                 xmin, xmax, ymin, ymax = geo2.GetEnvelope()
                 for fid1 in list(
@@ -692,10 +655,22 @@ class _Grid(object):
         return poly
 
 
-@ray.remote
-def _to_df_ray(in_data):
+# @ray.remote
+# def ray_mp(met_name, fid, ds, row, col, start_date, end_date):
+#     # met_name, fid, ds, row, col, start_date, end_date = in_data
+#     # logger.info('IN TEST RAY')
+#     pass
 
-    met_name, fid, ds, row, col, start_date, end_date = in_data
+
+@ray.remote
+def to_df_ray(in_data):
+    met_name, fid, met_nc, row, col, start_date, end_date = in_data
+
+    logger.info('IN DF')
+    ds = xr.open_dataset(met_nc)
+    logger.info(ds)
+    logger.info("DS PAss")
+
     out_df = None
     try_num = 1
     while out_df is None:
@@ -705,6 +680,7 @@ def _to_df_ray(in_data):
 
         try:
 
+            logger.info('ray remote in try')
             selection = ds.sel(day=slice(start_date, end_date)).isel({'lat':
                 row, 'lon': col}).drop(['crs', 'lat', 'lon']).rename({met_name:'VAL'})
             out_df = selection.to_dataframe()
@@ -733,6 +709,7 @@ def load_pickle():
     return data
 
 def _read_shapefile(in_shp, zone_field=None, filter_field=None):
+    logger.info("reading shapefile, {} {} {}".format(in_shp, zone_field, filter_field))
 
     # start_time = time.time()
     """
@@ -795,40 +772,80 @@ def _get_spatial_ref(in_shp):
     return epsg
 
 
-# def _python_mp(function, function_inputs, cpu_count):
-#     if cpu_count is None:
-#         cpu_count = mp.cpu_count()
-#     print(function, function_inputs)
-#     pool = mp.Pool(processes=cpu_count)
-#     data = pool.map(function, function_inputs)
-#     pool.close()
-#     pool.join()
-#
-#     return data
+def get_envelope(geom):
+
+    start_envelope_time = time.time()
+    (minX, maxX, minY, maxY) = geom.GetEnvelope()
+    # Create ring
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    ring.AddPoint(minX, minY)
+    ring.AddPoint(maxX, minY)
+    ring.AddPoint(maxX, maxY)
+    ring.AddPoint(minX, maxY)
+    ring.AddPoint(minX, minY)
+    envelope_time = time.time() - start_envelope_time
+    # Create polygon
+    poly_envelope = ogr.Geometry(ogr.wkbPolygon)
+    poly_envelope.AddGeometry(ring)
+
+    logger.info("Get envelope time {}".format(envelope_time))
+    return poly_envelope
+
 
 
 if __name__ == '__main__':
 
     pass
 
-    # start_time = time.perf_counter()
-
-    # zoneShpPath = r".\data\test_data\ABCWUA_GridMETPrj.shp"
-    # zoneField = 'FieldTest'
-    # yearFilter = '1990-1991'
-    # climateFilter = 'pr'
-    # climateFilter = ['pet', 'etr']
-    # climateFilter = 'break'
-    # zoneShpPath = sys.argv[1]
-    # zoneField = sys.argv[2]
-    # yearFilter = sys.argv[3]
-    # climateFilter = sys.argv[4].split(',')
-    # multiprocessing = bool(sys.argv[5])
-    # climateData = get_data(zoneShpPath, zoneField, year_filter=yearFilter,
-    #             climate_filter=climateFilter, multiprocessing=multiprocessing)
-    # end_time = time.perf_counter()
-    # print('run time', end_time - start_time)
-
-    # # print(climateData)
-    # dc = DataCollector()
-    # dc.
+    # huc12shp = r"C:\Users\domartin\Documents\WU\WaterUseData\Missing_HUC5.shp"
+    # huc12field = 'huc12'
+    # huc2Field = 'HUC2'
+    #
+    # # climate types to be processed
+    # climateFilter = ['pr', 'tmmn', 'tmmx', 'etr']
+    # # climateFilter = ['pr']
+    #
+    # huc2List = ['05']
+    # gmetDC = DataCollector(verbose=False)
+    #
+    # ot_folder = r'C:\Users\domartin\Documents\WU\WaterUseData\climate_data'
+    #
+    # # logger.info('Shapefile is {}'.format(wsaShp))
+    # # logger.info('Climate Filter is {}'.format(','.join(climateFilter)))
+    # # logger.info("Processing HUC12s for HUC2s {}".format(','.join(huc2List)))
+    # # logger.info('Output Folder {}'.format(ot_folder))
+    # totalTime = time.time()
+    # for huc2 in huc2List:
+    #     # logger.info("Processing huc12s for huc2 {}".format(huc2))
+    #     filterField = {huc2Field: huc2}
+    #     # filterField = {huc12Field: '102701040105'}
+    #     # filterField = {huc12Field: '031102030601'}
+    #     out_folder = os.path.join(ot_folder, 'huc{}'.format(huc2))
+    #     if not os.path.exists(out_folder):
+    #         os.mkdir(out_folder)
+    #     # process a single shapefile
+    #     huc12Time = time.time()
+    #     retry = True
+    #     loadpickle = False  # change this to start fresh
+    #     while retry:
+    #         try:
+    #             gmetDC.get_data(huc12shp, huc12field,
+    #                             climate_filter=climateFilter,
+    #                             year_filter='2000-2001', multiprocessing=False,
+    #                             filter_field=filterField,
+    #                             chunksize=20, save_to_csv=True,
+    #                             out_folder=out_folder, loadpickle=loadpickle,
+    #                             cpu_count=None)
+    #             retry = False
+    #         except Exception as e:
+    #             # logger.error('CDC CRASHED... RETRYING', exc_info=True)
+    #             print(e)
+    #             retry = False
+    #             loadpickle = False
+    #     huc12Time = time.time() - huc12Time
+    #     # logger.info(
+    #     #     'HUC12s for HUC2 = {} processing time = {}'.format(huc2, huc12Time))
+    #
+    # print('DONE!!!!')
+    # totalTime = time.time() - totalTime
+    # # logger.info('Script Complete: Run Time = {}'.format(totalTime))
